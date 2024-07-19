@@ -1,0 +1,333 @@
+import sys
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QRadioButton, QComboBox, QCheckBox, QPushButton,
+    QGroupBox, QGridLayout, QSpinBox, QDoubleSpinBox, QMessageBox,
+    QFileDialog, QSpacerItem, QSizePolicy,
+)
+from PyQt5.QtCore import QTimer, Qt
+import pyvisa
+import datetime
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+
+rfi_file_path = '15_july.rfi'
+
+class LiveSpectrumWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.figure = Figure(figsize=(5, 3), dpi=100)
+        self.canvas = FigureCanvas(self.figure)
+        self.ax = self.figure.add_subplot(111)
+        self.ax.set_title("Live Spectrum")
+        self.ax.set_xlabel("Frequency (MHz)")
+        self.ax.set_ylabel("Amplitude (dBm)")
+        layout = QVBoxLayout()
+        layout.addWidget(self.canvas)
+        self.setLayout(layout)
+        self.data = None
+
+    def update_data(self, data):
+        self.data = data
+        self.plot_data()
+
+    def plot_data(self):
+        self.ax.clear()
+        if self.data is not None:
+            self.ax.plot(self.data)
+        self.canvas.draw()
+
+class SpectrumAnalyzerApp(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.initUI()
+
+    def initUI(self):
+        self.fig, self.ax = plt.subplots(figsize=(10, 6))
+        self.canvas = FigureCanvas(self.fig)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.canvas)
+        self.pause_button = QPushButton('Pause')
+        self.pause_button.clicked.connect(self.pause_updates)
+        self.resume_button = QPushButton('Resume')
+        self.resume_button.clicked.connect(self.resume_updates)
+        self.save_image_button = QPushButton('Save Image')
+        self.save_image_button.clicked.connect(self.save_plot_image)
+        self.reset_params_button = QPushButton('Reset Parameters')
+        self.reset_params_button.clicked.connect(self.reset_parameters)
+        button_layout = QHBoxLayout()
+        button_layout.addWidget(self.pause_button)
+        button_layout.addWidget(self.resume_button)
+        button_layout.addWidget(self.save_image_button)
+        button_layout.addWidget(self.reset_params_button)
+        layout.addLayout(button_layout)
+        self.rm = pyvisa.ResourceManager()
+        try:
+            self.sa = self.rm.open_resource('TCPIP0::192.168.8.36::inst0::INSTR')
+        except pyvisa.VisaIOError as e:
+            QMessageBox.critical(self, "Error", f"Failed to connect to spectrum analyzer: {str(e)}")
+            return
+        self.pause = False
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update_plot)
+        self.timer.start(1000)
+
+    def update_plot(self):
+        if not self.pause:
+            try:
+                trace_data = self.sa.query_ascii_values('TRACE:DATA? TRACE1')
+                current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                center_freq = float(self.sa.query(':SENSE:FREQ:CENTER?')) / 1e6
+                span = float(self.sa.query(':SENSE:FREQ:SPAN?')) / 1e9
+                rbw = float(self.sa.query(':SENSE:BAND:RES?')) / 1e3
+                vbw = float(self.sa.query(':SENSE:BAND:VID?')) / 1e3
+                ref_level = float(self.sa.query(':DISP:WIND:TRAC:Y:RLEV?'))
+                sweep_time_sec = float(self.sa.query(':SWE:TIME?'))
+                amp_div = float(self.sa.query(':DISP:WIND:TRAC:Y:SCAL?'))
+                att = float(self.sa.query(':INP:ATT?'))
+                avg_num = float(self.sa.query(':AVER:COUN?'))
+                sweep_time_ms = sweep_time_sec * 1000.0
+
+                with open(rfi_file_path, 'a') as file:
+                    file.write(f"{current_time},{center_freq:.6f},{span:.9f},{rbw:.3f},{vbw:.3f},{ref_level},{sweep_time_ms},{amp_div},{att},{avg_num},*\n")
+                    file.write(','.join(map(lambda x: f"{x:.2f}", trace_data)) + ',@\n\n')
+
+                self.ax.clear()
+                self.ax.plot(trace_data)
+                self.ax.set_xlabel('Frequency (MHz)')
+                self.ax.set_ylabel('Amplitude (dBm)')
+                self.ax.set_title('Live Spectrum Monitor')
+                self.ax.grid(True)
+                self.canvas.draw()
+
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Error updating plot: {str(e)}")
+
+    def pause_updates(self):
+        self.pause = True
+
+    def resume_updates(self):
+        self.pause = False
+        self.update_plot()
+
+    def save_plot_image(self):
+        try:
+            file_path, _ = QFileDialog.getSaveFileName(self, "Save Plot Image", "", "PNG Image (*.png);;JPEG Image (*.jpg *.jpeg);;All Files (*.*)")
+            if file_path:
+                self.fig.savefig(file_path)
+                QMessageBox.information(self, "Saved", "Plot image saved successfully!")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error saving plot image: {str(e)}")
+
+    def reset_parameters(self):
+        try:
+            self.sa.write("*RST")
+            default_center_freq = 100e6
+            default_span = 1e9
+            default_rbw = 100e3
+            default_vbw = 100e3
+            default_ref_level = -10.0
+            default_amp_div = 10.0
+            default_att = 0.0
+            default_avg_num = 1.0
+            self.sa.write(f":SENSE:FREQ:CENTER {default_center_freq}")
+            self.sa.write(f":SENSE:FREQ:SPAN {default_span}")
+            self.sa.write(f":SENSE:BAND:RES {default_rbw}")
+            self.sa.write(f":SENSE:BAND:VID {default_vbw}")
+            self.sa.write(f":DISP:WIND:TRAC:Y:RLEV {default_ref_level}")
+            self.sa.write(f":DISP:WIND:TRAC:Y:SCAL {default_amp_div}")
+            self.sa.write(f":INP:ATT {default_att}")
+            self.sa.write(f":AVER:COUN {default_avg_num}")
+            QMessageBox.information(self, "Success", "Parameters reset to default values.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to reset parameters: {str(e)}")
+
+class RFIMonitoringServer(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("RFI Monitoring Server")
+        self.setFixedSize(1024, 900)
+        self.create_widgets()
+
+    def create_widgets(self):
+        main_layout = QHBoxLayout(self)
+        left_layout = QVBoxLayout()
+        main_layout.addLayout(left_layout)
+
+        # Application Settings Group
+        application_settings_group = QGroupBox("APPLICATION SETTINGS")
+        application_settings_layout = QVBoxLayout()
+        spectrum_dump_radio = QRadioButton("Spectrum Dump with Antenna Switching")
+        all_antennae_checkbox = QCheckBox("All Antennae in Single Plot")
+        normal_spectrum_dump_radio = QRadioButton("Normal Spectrum Dump Only")
+        load_setting_button = QPushButton("Load Setting File")
+        load_setting_button.setFixedSize(150, 25)
+        load_setting_button.clicked.connect(self.load_setting_file)
+        save_setting_button = QPushButton("Save Setting File")
+        save_setting_button.setFixedSize(150, 25)
+        application_settings_layout.addWidget(spectrum_dump_radio)
+        application_settings_layout.addWidget(all_antennae_checkbox)
+        application_settings_layout.addWidget(normal_spectrum_dump_radio)
+        button_layout = QHBoxLayout()
+        button_layout.addWidget(load_setting_button)
+        button_layout.addWidget(save_setting_button)
+        application_settings_layout.addLayout(button_layout)
+        application_settings_group.setLayout(application_settings_layout)
+        left_layout.addWidget(application_settings_group)
+
+        # Spectrum Analyzer Settings Group
+        spectrum_analyzer_settings_group = QGroupBox("SPECTRUM ANALYZER SETTINGS")
+        spectrum_analyzer_settings_layout = QGridLayout()
+        self.center_spinbox = self.create_spinbox(0, 1000, 750, "Center Frequency (MHz):", spectrum_analyzer_settings_layout, 0, 0, width=80)
+        self.span_spinbox = self.create_spinbox(0, 1000, 1500, "Frequency Span (MHz):", spectrum_analyzer_settings_layout, 1, 0, width=80)
+        self.rbw_combobox = self.create_combobox(["3", "10", "30", "100", "300", "1000", "3000"], "Resolution Bandwidth (KHz):", spectrum_analyzer_settings_layout, 2, 0, width=80)
+        self.vbw_combobox = self.create_combobox(["3", "10", "30", "100", "300", "1000", "3000"], "Video Bandwidth (KHz):", spectrum_analyzer_settings_layout, 3, 0, width=80)
+        self.sweep_time_combobox = self.create_combobox(["Auto", "Manual"], "Sweep Time (ms):", spectrum_analyzer_settings_layout, 4, 0, width=80)
+        self.reference_level_spinbox = self.create_spinbox(-100, 30, -10, "Reference Level (dBm):", spectrum_analyzer_settings_layout, 5, 0, width=80)
+        self.input_attenuation_spinbox = self.create_spinbox(0, 50, 10, "Input Attenuation (dB):", spectrum_analyzer_settings_layout, 6, 0, width=80)
+        self.amp_div_spinbox = self.create_spinbox(1, 20, 10, "Amplitude Division (dB):", spectrum_analyzer_settings_layout, 7, 0, width=80)
+        submit_button = QPushButton("Submit")
+        submit_button.setFixedSize(150, 25)
+        submit_button.clicked.connect(self.submit_settings)
+        spectrum_analyzer_settings_layout.addWidget(submit_button, 8, 0, 1, 2)
+        spectrum_analyzer_settings_group.setLayout(spectrum_analyzer_settings_layout)
+        left_layout.addWidget(spectrum_analyzer_settings_group)
+
+        # Final Settings Group
+        self.final_settings_group = QGroupBox("FINAL SETTINGS")
+        final_settings_layout = QGridLayout()
+        self.final_center_label = QLabel("")
+        self.final_span_label = QLabel("")
+        self.final_rbw_label = QLabel("")
+        self.final_vbw_label = QLabel("")
+        self.final_sweep_time_label = QLabel("")
+        self.final_reference_level_label = QLabel("")
+        self.final_input_attenuation_label = QLabel("")
+        self.final_amp_div_label = QLabel("")
+        final_settings_layout.addWidget(QLabel("Center Frequency (MHz):"), 0, 0)
+        final_settings_layout.addWidget(self.final_center_label, 0, 1)
+        final_settings_layout.addWidget(QLabel("Frequency Span (MHz):"), 1, 0)
+        final_settings_layout.addWidget(self.final_span_label, 1, 1)
+        final_settings_layout.addWidget(QLabel("Resolution Bandwidth (KHz):"), 2, 0)
+        final_settings_layout.addWidget(self.final_rbw_label, 2, 1)
+        final_settings_layout.addWidget(QLabel("Video Bandwidth (KHz):"), 3, 0)
+        final_settings_layout.addWidget(self.final_vbw_label, 3, 1)
+        final_settings_layout.addWidget(QLabel("Sweep Time (ms):"), 4, 0)
+        final_settings_layout.addWidget(self.final_sweep_time_label, 4, 1)
+        final_settings_layout.addWidget(QLabel("Reference Level (dBm):"), 5, 0)
+        final_settings_layout.addWidget(self.final_reference_level_label, 5, 1)
+        final_settings_layout.addWidget(QLabel("Input Attenuation (dB):"), 6, 0)
+        final_settings_layout.addWidget(self.final_input_attenuation_label, 6, 1)
+        final_settings_layout.addWidget(QLabel("Amplitude Division (dB):"), 7, 0)
+        final_settings_layout.addWidget(self.final_amp_div_label, 7, 1)
+        self.add_data_dump_duration(final_settings_layout)
+        self.final_settings_group.setLayout(final_settings_layout)
+        left_layout.addWidget(self.final_settings_group)
+
+        # Buttons Layout
+        button_layout = QHBoxLayout()
+        self.reset_button = QPushButton("RESET")
+        self.reset_button.setFixedSize(150, 30)
+        self.start_button = QPushButton("START")
+        self.start_button.setFixedSize(150, 30)
+        self.reset_button.clicked.connect(self.reset_spectrum_analyzer_settings)
+        self.start_button.clicked.connect(self.start_spectrum_analysis)
+        button_layout.addWidget(self.reset_button)
+        button_layout.addWidget(self.start_button)
+        left_layout.addLayout(button_layout)
+
+        # Live Spectrum Monitor Group (unchanged)
+
+        main_layout.addLayout(left_layout)
+
+    def create_spinbox(self, minimum, maximum, default, label_text, layout, row, column, width=None):
+        label = QLabel(label_text)
+        spinbox = QDoubleSpinBox()
+        spinbox.setRange(minimum, maximum)
+        spinbox.setValue(default)
+        if width:
+            spinbox.setFixedWidth(width)
+        layout.addWidget(label, row, column)
+        layout.addWidget(spinbox, row, column + 1)
+        return spinbox
+
+    def create_combobox(self, items, label_text, layout, row, column, width=None):
+        label = QLabel(label_text)
+        combobox = QComboBox()
+        combobox.addItems(items)
+        if width:
+            combobox.setFixedWidth(width)
+        layout.addWidget(label, row, column)
+        layout.addWidget(combobox, row, column + 1)
+        return combobox
+
+    def add_data_dump_duration(self, final_settings_layout):
+        duration_label = QLabel("Data Dump Duration ::")
+        duration_input = QLabel("Enter Duration Here")
+        final_settings_layout.addWidget(duration_label, 8, 0)
+        final_settings_layout.addWidget(duration_input, 8, 1)
+
+    def reset_spectrum_analyzer_settings(self):
+        self.center_spinbox.setValue(750)
+        self.span_spinbox.setValue(1500)
+        self.rbw_combobox.setCurrentIndex(0)
+        self.vbw_combobox.setCurrentIndex(0)
+        self.sweep_time_combobox.setCurrentIndex(0)
+        self.reference_level_spinbox.setValue(-10)
+        self.input_attenuation_spinbox.setValue(10)
+        self.amp_div_spinbox.setValue(10)
+
+    def load_setting_file(self):
+        file_dialog = QFileDialog(self)
+        file_dialog.setNameFilter("Setting Files (*.rfi)")
+        if file_dialog.exec_():
+            file_path = file_dialog.selectedFiles()[0]
+            with open(file_path, 'r') as file:
+                settings = file.readlines()
+            self.apply_settings(settings)
+
+    def apply_settings(self, settings):
+        try:
+            self.center_spinbox.setValue(float(settings[0].strip()))
+            self.span_spinbox.setValue(float(settings[1].strip()))
+            self.rbw_combobox.setCurrentText(settings[2].strip())
+            self.vbw_combobox.setCurrentText(settings[3].strip())
+            self.sweep_time_combobox.setCurrentText(settings[4].strip())
+            self.reference_level_spinbox.setValue(float(settings[5].strip()))
+            self.input_attenuation_spinbox.setValue(float(settings[6].strip()))
+            self.amp_div_spinbox.setValue(float(settings[7].strip()))
+            QMessageBox.information(self, "Success", "Settings loaded successfully.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error applying settings: {str(e)}")
+
+    def submit_settings(self):
+        self.update_final_settings()
+
+    def update_final_settings(self):
+        self.final_center_label.setText(str(self.center_spinbox.value()))
+        self.final_span_label.setText(str(self.span_spinbox.value()))
+        self.final_rbw_label.setText(self.rbw_combobox.currentText())
+        self.final_vbw_label.setText(self.vbw_combobox.currentText())
+        self.final_sweep_time_label.setText(self.sweep_time_combobox.currentText())
+        self.final_reference_level_label.setText(str(self.reference_level_spinbox.value()))
+        self.final_input_attenuation_label.setText(str(self.input_attenuation_spinbox.value()))
+        self.final_amp_div_label.setText(str(self.amp_div_spinbox.value()))
+
+    def start_spectrum_analysis(self):
+        # Here you would create or show your plot widget
+        plot_widget = self.create_plot_widget()
+        plot_widget.show()  # Replace with appropriate method to display the plot
+
+    def create_plot_widget(self):
+        # Replace this with your actual plotting logic or widget creation
+        # Example: Creating a QLabel to simulate a plot widget
+        plot_label = QLabel("Plot Widget Placeholder")
+        plot_label.setAlignment(Qt.AlignCenter)
+        return plot_label
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    server = RFIMonitoringServer()
+    server.show()
+    sys.exit(app.exec_())
